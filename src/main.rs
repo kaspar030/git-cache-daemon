@@ -4,9 +4,9 @@ use std::time::Duration;
 
 use camino::{Utf8Component, Utf8Path, Utf8PathBuf};
 use monoio::io::{AsyncReadRent, Splitable};
+use monoio::join;
 use monoio::net::{TcpListener, TcpStream};
-use monoio::select;
-use tracing::info;
+use tracing::{debug, info, trace, warn};
 
 use monoio::io::zero_copy;
 
@@ -27,7 +27,7 @@ async fn main() {
                 monoio::spawn(handle_client(stream));
             }
             Err(e) => {
-                info!("accepting connection failed: {e}");
+                warn!("accepting connection failed: {e}");
             }
         }
     }
@@ -35,12 +35,14 @@ async fn main() {
 
 async fn handle_client(mut stream: TcpStream) -> std::io::Result<()> {
     let (host, path) = parse_request(&mut stream).await?;
+    let client = stream.peer_addr().unwrap();
 
-    info!("client requests {host} {path}");
+    info!("{client} requests {host} {path}");
 
     prefetch(&format!("https://{host}{path}")).await?;
 
-    info!("prefetch ok, serving repo");
+    trace!("prefetch ok, serving repo");
+
     upload_pack(stream, host, path).await?;
 
     Ok(())
@@ -54,10 +56,10 @@ async fn prefetch(url: &str) -> Result<(), Error> {
 
     for _ in 0..100 {
         if command.try_wait()?.is_some() {
-            info!("child reaped");
+            trace!("child reaped");
             break;
         }
-        monoio::time::sleep(Duration::from_secs(1)).await;
+        monoio::time::sleep(Duration::from_millis(100)).await;
     }
 
     Ok(())
@@ -79,35 +81,27 @@ async fn upload_pack(stream: TcpStream, host: Utf8PathBuf, path: Utf8PathBuf) ->
         .stdout(stdout_send)
         .spawn()?;
 
+    let peer = stream.peer_addr().unwrap();
     let (mut read, mut write) = stream.into_split();
 
-    let mut in_n = None;
-    let mut out_n = None;
+    let (out_n, in_n) = join!(
+        zero_copy(&mut stdout_recv, &mut write),
+        zero_copy(&mut read, &mut stdin_send)
+    );
 
-    loop {
-        info!("entering loop");
-        select! {
-            to_stream = zero_copy(&mut stdout_recv, &mut write), if out_n.is_none() => {
-                info!("to_stream {:?}", to_stream);
-                out_n = Some(to_stream);
-            }
-            from_stream = zero_copy(&mut read, &mut stdin_send), if in_n.is_none() => {
-                info!("from_stream {:?}", from_stream);
-                in_n = Some(from_stream);
-            }
-        };
+    if let Ok(in_bytes) = in_n
+        && let Ok(out_bytes) = out_n
+    {
+        info!("{peer}: in: {in_bytes}b, out: {out_bytes}b");
+    }
 
-        if out_n.is_some() && in_n.is_some() {
-            if let Some(res) = command.try_wait()? {
-                if !res.success() {
-                    info!("warn: git-upload-pack errored");
-                }
-                break;
-            } else {
-                info!("child still running");
-                monoio::time::sleep(Duration::from_millis(100)).await;
-            }
+    if let Some(res) = command.try_wait()? {
+        if !res.success() {
+            warn!("git-upload-pack errored");
         }
+    } else {
+        debug!("child still running");
+        monoio::time::sleep(Duration::from_millis(100)).await;
     }
 
     Ok(())
@@ -129,13 +123,14 @@ async fn parse_request(stream: &mut TcpStream) -> Result<(Utf8PathBuf, Utf8PathB
             return Err(Error::from(ErrorKind::UnexpectedEof));
         }
 
-        info!("got {buf_pos}b");
+        trace!("got {buf_pos}b");
         if buf_pos < 4 {
-            info!("expected four bytes");
+            trace!("expected four bytes");
+            return Err(Error::from(ErrorKind::InvalidData));
         }
 
         if &buf[0..4] == b"0000" {
-            info!("got flush-pkt");
+            trace!("got flush-pkt");
             // clear
             buf.clear();
             continue;
@@ -158,15 +153,15 @@ async fn parse_request(stream: &mut TcpStream) -> Result<(Utf8PathBuf, Utf8PathB
 
         let parts: Result<Vec<&str>, _> = payload
             .split(|&item| item == 0)
-            .filter(|part| part.len() != 0)
+            .filter(|part| !part.is_empty())
             .map(|part| str::from_utf8(part))
             .collect();
 
         let parts = parts.map_err(|_| bad_pkt())?;
 
         let mut cmd_and_pathname = parts[0].split(' ');
-        let request_command = cmd_and_pathname.next().ok_or_else(|| bad_pkt())?;
-        let pathname = cmd_and_pathname.next().ok_or_else(|| bad_pkt())?;
+        let request_command = cmd_and_pathname.next().ok_or_else(bad_pkt)?;
+        let pathname = cmd_and_pathname.next().ok_or(bad_pkt())?;
 
         if request_command != "git-upload-pack" {
             return Err(bad_pkt());
@@ -178,7 +173,7 @@ async fn parse_request(stream: &mut TcpStream) -> Result<(Utf8PathBuf, Utf8PathB
 
 fn split_hostname(path: &Utf8Path) -> (Utf8PathBuf, Utf8PathBuf) {
     let mut components: Vec<_> = path.components().collect();
-    let host = if let Some(Utf8Component::RootDir) = components.get(0) {
+    let host = if let Some(Utf8Component::RootDir) = components.first() {
         components.remove(1)
     } else {
         components.remove(0)
