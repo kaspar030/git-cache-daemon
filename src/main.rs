@@ -1,5 +1,6 @@
 use std::io::{Error, ErrorKind};
 use std::process::Command;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use camino::{Utf8Component, Utf8Path, Utf8PathBuf};
@@ -10,15 +11,38 @@ use tracing::{debug, info, trace, warn};
 
 use monoio::io::zero_copy;
 
+use argh::FromArgs;
+
+static GIT_CACHE_DIR: OnceLock<Utf8PathBuf> = OnceLock::new();
+
+#[derive(FromArgs)]
+/// Command line arguments
+struct Args {
+    /// address to listen on, default: 127.0.0.1:9418
+    #[argh(option, short = 'l', default = "String::from(\"127.0.0.1:9418\")")]
+    listen_address: String,
+
+    /// directory for git cache
+    #[argh(option)]
+    git_cache_dir: Option<String>,
+}
+
 #[monoio::main(timer_enabled = true)]
 async fn main() {
+    let args: Args = argh::from_env();
+
     // initialize logging
     let subscriber = tracing_subscriber::FmtSubscriber::new();
     tracing::subscriber::set_global_default(subscriber).unwrap();
 
+    // chose git cache directory
+    git_cache_dir_set(args.git_cache_dir);
+    info!("serving git cache from {}", GIT_CACHE_DIR.get().unwrap());
+
     // start listening
-    let listener = TcpListener::bind("127.0.0.1:9418").unwrap();
-    info!("listening");
+    let listener = TcpListener::bind(args.listen_address).unwrap();
+    info!("listening on {}", listener.local_addr().unwrap());
+
     loop {
         let incoming = listener.accept().await;
         match incoming {
@@ -31,6 +55,20 @@ async fn main() {
             }
         }
     }
+}
+
+fn git_cache_dir_set(git_cache_dir_arg: Option<String>) {
+    let git_cache_dir_str = if let Some(git_cache_dir_arg) = git_cache_dir_arg {
+        git_cache_dir_arg
+    } else if let Ok(git_cache_dir) = std::env::var("GIT_CACHE_DIR") {
+        git_cache_dir
+    } else {
+        "~/.gitcache".into()
+    };
+
+    let git_cache_dir = Utf8PathBuf::from(&shellexpand::tilde(&git_cache_dir_str));
+
+    GIT_CACHE_DIR.set(git_cache_dir).unwrap();
 }
 
 async fn handle_client(mut stream: TcpStream) -> std::io::Result<()> {
@@ -50,7 +88,10 @@ async fn handle_client(mut stream: TcpStream) -> std::io::Result<()> {
 
 async fn prefetch(url: &str) -> Result<(), Error> {
     let mut command = Command::new("git")
-        .env("GIT_CONFIG_GLOBAL", "/home/kaspar/.gitcache/config")
+        .env(
+            "GIT_CONFIG_GLOBAL",
+            format!("{}/config", GIT_CACHE_DIR.get().unwrap()),
+        )
         .args(["cache", "prefetch", "-U", url])
         .spawn()?;
 
@@ -69,7 +110,7 @@ async fn upload_pack(stream: TcpStream, host: Utf8PathBuf, path: Utf8PathBuf) ->
     let (stdin_recv, mut stdin_send) = monoio::net::unix::new_pipe()?;
     let (mut stdout_recv, stdout_send) = monoio::net::unix::new_pipe()?;
 
-    let mut path = Utf8PathBuf::from(&format!("/home/kaspar/.gitcache/{host}{path}"));
+    let mut path = Utf8PathBuf::from(&format!("{}/{host}{path}", GIT_CACHE_DIR.get().unwrap()));
     path.set_extension("git");
 
     let mut command = Command::new("git-upload-pack")
