@@ -92,6 +92,7 @@ async fn prefetch(url: &str) -> Result<(), Error> {
             "GIT_CONFIG_GLOBAL",
             format!("{}/config", GIT_CACHE_DIR.get().unwrap()),
         )
+        .env("GIT_CONFIG_NOSYSTEM", "true")
         .args(["cache", "prefetch", "-U", url])
         .spawn()?;
 
@@ -113,10 +114,16 @@ async fn upload_pack(stream: TcpStream, host: Utf8PathBuf, path: Utf8PathBuf) ->
     let mut path = Utf8PathBuf::from(&format!("{}/{host}{path}", GIT_CACHE_DIR.get().unwrap()));
     path.set_extension("git");
 
+    info!("spawning git-upload-pack");
+
     let mut command = Command::new("git-upload-pack")
-        .env("GIT_CONFIG_COUNT", "1")
+        .env("GIT_CONFIG_COUNT", "3")
         .env("GIT_CONFIG_KEY_0", "uploadpack.allowAnySHA1InWant")
         .env("GIT_CONFIG_VALUE_0", "true")
+        .env("GIT_CONFIG_KEY_1", "uploadpack.allowFilter")
+        .env("GIT_CONFIG_VALUE_1", "true")
+        .env("GIT_CONFIG_KEY_2", "uploadpack.allowRefInWant")
+        .env("GIT_CONFIG_VALUE_2", "true")
         .args(["--strict", path.as_str()])
         .stdin(stdin_recv)
         .stdout(stdout_send)
@@ -125,10 +132,14 @@ async fn upload_pack(stream: TcpStream, host: Utf8PathBuf, path: Utf8PathBuf) ->
     let peer = stream.peer_addr().unwrap();
     let (mut read, mut write) = stream.into_split();
 
+    info!("starting git-upload-pack join");
+
     let (out_n, in_n) = join!(
         zero_copy(&mut stdout_recv, &mut write),
         zero_copy(&mut read, &mut stdin_send)
     );
+
+    info!("git-upload-pack join done");
 
     if let Ok(in_bytes) = in_n
         && let Ok(out_bytes) = out_n
@@ -138,10 +149,10 @@ async fn upload_pack(stream: TcpStream, host: Utf8PathBuf, path: Utf8PathBuf) ->
 
     if let Some(res) = command.try_wait()? {
         if !res.success() {
-            warn!("git-upload-pack errored");
+            info!("git-upload-pack errored");
         }
     } else {
-        debug!("child still running");
+        info!("child still running");
         monoio::time::sleep(Duration::from_millis(100)).await;
     }
 
@@ -200,6 +211,7 @@ async fn parse_request(stream: &mut TcpStream) -> Result<(Utf8PathBuf, Utf8PathB
 
         let parts = parts.map_err(|_| bad_pkt())?;
 
+        println!("parts: {parts:?}");
         let mut cmd_and_pathname = parts[0].split(' ');
         let request_command = cmd_and_pathname.next().ok_or_else(bad_pkt)?;
         let pathname = cmd_and_pathname.next().ok_or(bad_pkt())?;

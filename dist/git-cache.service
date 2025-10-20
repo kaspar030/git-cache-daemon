@@ -1,0 +1,12 @@
+[Unit]
+Description=Git Cache Daemon
+
+[Service]
+Type=simple
+User=1001
+Group=1001
+Environment=GIT_CACHE_DIR=/cache/gitcache
+ExecStart=/usr/bin/git-cache-daemon
+
+[Install]
+WantedBy=multi-user.target
