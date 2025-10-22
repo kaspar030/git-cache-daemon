@@ -1,6 +1,9 @@
+use std::collections::HashMap;
 use std::io::{Error, ErrorKind};
 use std::process::Command;
-use std::sync::OnceLock;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering::{Acquire, Release};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use camino::{Utf8Component, Utf8Path, Utf8PathBuf};
@@ -12,6 +15,8 @@ use tracing::{debug, info, trace, warn};
 use monoio::io::zero_copy;
 
 use argh::FromArgs;
+
+type UpdateBarrier = Arc<Mutex<HashMap<String, u64>>>;
 
 static GIT_CACHE_DIR: OnceLock<Utf8PathBuf> = OnceLock::new();
 
@@ -25,6 +30,19 @@ struct Args {
     /// directory for git cache
     #[argh(option)]
     git_cache_dir: Option<String>,
+
+    /// enable update barrier
+    #[argh(switch, short = 'u')]
+    update_barrier: bool,
+}
+
+static UPDATE_BARRIER: AtomicU64 = AtomicU64::new(0);
+
+fn now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
 }
 
 #[monoio::main(timer_enabled = true)]
@@ -43,12 +61,25 @@ async fn main() {
     let listener = TcpListener::bind(args.listen_address).unwrap();
     info!("listening on {}", listener.local_addr().unwrap());
 
+    // set up update barrier
+    if args.update_barrier {
+        info!("update barrier enabled");
+        UPDATE_BARRIER.store(now(), Release);
+    }
+
+    let update_barrier: UpdateBarrier = Arc::new(Mutex::new(HashMap::new()));
+
     loop {
         let incoming = listener.accept().await;
         match incoming {
             Ok((stream, addr)) => {
                 info!("accepted a connection from {addr}");
-                monoio::spawn(handle_client(stream));
+                let maybe_update_barrier = if args.update_barrier {
+                    Some(update_barrier.clone())
+                } else {
+                    None
+                };
+                monoio::spawn(handle_client(stream, maybe_update_barrier));
             }
             Err(e) => {
                 warn!("accepting connection failed: {e}");
@@ -71,23 +102,51 @@ fn git_cache_dir_set(git_cache_dir_arg: Option<String>) {
     GIT_CACHE_DIR.set(git_cache_dir).unwrap();
 }
 
-async fn handle_client(mut stream: TcpStream) -> std::io::Result<()> {
+async fn handle_client(
+    mut stream: TcpStream,
+    mut update_barrier: Option<UpdateBarrier>,
+) -> std::io::Result<()> {
+    let client = stream.peer_addr().unwrap();
+
     let GitRequest {
         host,
         path,
         version_string,
     } = parse_request(&mut stream).await?;
-    let client = stream.peer_addr().unwrap();
 
-    info!("{client} requests {host} {path}");
+    let url = format!("https://{host}{path}");
 
-    prefetch(&format!("https://{host}{path}")).await?;
+    info!("{client} requests {url}");
 
-    trace!("prefetch ok, serving repo");
+    if update_barrier_check(update_barrier.as_ref(), &url) {
+        info!("updating {url}");
+        prefetch(&url).await?;
+        update_barrier_update(update_barrier.as_mut().as_deref(), url);
+    } else {
+        info!("{url} was updated since update barrier, skipping update");
+    }
 
+    info!("{client} serving repo");
     upload_pack(stream, host, path, version_string).await?;
 
     Ok(())
+}
+
+fn update_barrier_check(update_barrier: Option<&UpdateBarrier>, url: &str) -> bool {
+    if let Some(update_barrier) = update_barrier
+        && let Some(instant) = update_barrier.lock().unwrap().get(url)
+        && *instant >= UPDATE_BARRIER.load(Acquire)
+    {
+        false
+    } else {
+        true
+    }
+}
+
+fn update_barrier_update(update_barrier: Option<&UpdateBarrier>, url: String) {
+    if let Some(update_barrier) = update_barrier {
+        update_barrier.lock().unwrap().insert(url, now());
+    }
 }
 
 async fn prefetch(url: &str) -> Result<(), Error> {
