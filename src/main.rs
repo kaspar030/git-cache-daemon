@@ -72,7 +72,11 @@ fn git_cache_dir_set(git_cache_dir_arg: Option<String>) {
 }
 
 async fn handle_client(mut stream: TcpStream) -> std::io::Result<()> {
-    let (host, path) = parse_request(&mut stream).await?;
+    let GitRequest {
+        host,
+        path,
+        version_string,
+    } = parse_request(&mut stream).await?;
     let client = stream.peer_addr().unwrap();
 
     info!("{client} requests {host} {path}");
@@ -81,7 +85,7 @@ async fn handle_client(mut stream: TcpStream) -> std::io::Result<()> {
 
     trace!("prefetch ok, serving repo");
 
-    upload_pack(stream, host, path).await?;
+    upload_pack(stream, host, path, version_string).await?;
 
     Ok(())
 }
@@ -107,7 +111,12 @@ async fn prefetch(url: &str) -> Result<(), Error> {
     Ok(())
 }
 
-async fn upload_pack(stream: TcpStream, host: Utf8PathBuf, path: Utf8PathBuf) -> Result<(), Error> {
+async fn upload_pack(
+    stream: TcpStream,
+    host: String,
+    path: Utf8PathBuf,
+    version_string: Option<String>,
+) -> Result<(), Error> {
     let (stdin_recv, mut stdin_send) = monoio::net::unix::new_pipe()?;
     let (mut stdout_recv, stdout_send) = monoio::net::unix::new_pipe()?;
 
@@ -117,6 +126,10 @@ async fn upload_pack(stream: TcpStream, host: Utf8PathBuf, path: Utf8PathBuf) ->
     info!("spawning git-upload-pack");
 
     let mut command = Command::new("git-upload-pack")
+        .env(
+            "GIT_PROTOCOL_ENVIRONMENT",
+            version_string.as_ref().map_or("version=0", |v| v),
+        )
         .env("GIT_CONFIG_COUNT", "3")
         .env("GIT_CONFIG_KEY_0", "uploadpack.allowAnySHA1InWant")
         .env("GIT_CONFIG_VALUE_0", "true")
@@ -159,7 +172,13 @@ async fn upload_pack(stream: TcpStream, host: Utf8PathBuf, path: Utf8PathBuf) ->
     Ok(())
 }
 
-async fn parse_request(stream: &mut TcpStream) -> Result<(Utf8PathBuf, Utf8PathBuf), Error> {
+struct GitRequest {
+    host: String,
+    path: Utf8PathBuf,
+    version_string: Option<String>,
+}
+
+async fn parse_request(stream: &mut TcpStream) -> Result<GitRequest, Error> {
     fn bad_pkt() -> Error {
         Error::new(ErrorKind::InvalidData, "Malformed packet")
     }
@@ -216,15 +235,32 @@ async fn parse_request(stream: &mut TcpStream) -> Result<(Utf8PathBuf, Utf8PathB
         let request_command = cmd_and_pathname.next().ok_or_else(bad_pkt)?;
         let pathname = cmd_and_pathname.next().ok_or(bad_pkt())?;
 
+        let mut version_string = None;
+
+        for part in parts.iter().skip(1) {
+            if part.starts_with("host=") {
+            } else if part.starts_with("version=") {
+                version_string = Some(part.to_string());
+            }
+        }
+
         if request_command != "git-upload-pack" {
             return Err(bad_pkt());
         }
 
-        return Ok(split_hostname(Utf8Path::new(pathname)));
+        let (host, path) = split_hostname(Utf8Path::new(pathname));
+
+        let request = GitRequest {
+            host,
+            path,
+            version_string,
+        };
+
+        return Ok(request);
     }
 }
 
-fn split_hostname(path: &Utf8Path) -> (Utf8PathBuf, Utf8PathBuf) {
+fn split_hostname(path: &Utf8Path) -> (String, Utf8PathBuf) {
     let mut components: Vec<_> = path.components().collect();
     let host = if let Some(Utf8Component::RootDir) = components.first() {
         components.remove(1)
@@ -233,5 +269,5 @@ fn split_hostname(path: &Utf8Path) -> (Utf8PathBuf, Utf8PathBuf) {
     };
     let path = components.iter().collect::<Utf8PathBuf>();
 
-    (Utf8PathBuf::from(host.as_str()), path)
+    (host.as_str().to_string(), path)
 }
