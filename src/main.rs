@@ -65,6 +65,7 @@ async fn main() {
     if args.update_barrier {
         info!("update barrier enabled");
         UPDATE_BARRIER.store(now(), Release);
+        update_barrier_handle_signal();
     }
 
     let update_barrier: UpdateBarrier = Arc::new(Mutex::new(HashMap::new()));
@@ -85,6 +86,17 @@ async fn main() {
                 warn!("accepting connection failed: {e}");
             }
         }
+    }
+}
+
+fn update_barrier_handle_signal() {
+    // SAFETY: within signal handler, only getting time and updating atomic
+    unsafe {
+        signal_hook::low_level::register(signal_hook::consts::SIGUSR1, || {
+            let now = now();
+            UPDATE_BARRIER.store(now, Release);
+        })
+        .unwrap();
     }
 }
 
