@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::io::{Error, ErrorKind};
+use std::io::{Error, ErrorKind, pipe};
 use std::process::Command;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering::{Acquire, Release};
@@ -7,12 +7,12 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use camino::{Utf8Component, Utf8Path, Utf8PathBuf};
-use monoio::io::{AsyncReadRent, Splitable};
-use monoio::join;
-use monoio::net::{TcpListener, TcpStream};
+use either::Either;
+use smol::io::{BufReader, BufWriter, copy, split};
+use smol::net::{TcpListener, TcpStream};
 use tracing::{debug, info, trace, warn};
 
-use monoio::io::zero_copy;
+use smol::{Unblock, io, prelude::*};
 
 use argh::FromArgs;
 
@@ -45,20 +45,23 @@ fn now() -> u64 {
         .as_millis() as u64
 }
 
-#[monoio::main(timer_enabled = true)]
-async fn main() {
+fn main() -> io::Result<()> {
     let args: Args = argh::from_env();
 
     // initialize logging
     let subscriber = tracing_subscriber::FmtSubscriber::new();
     tracing::subscriber::set_global_default(subscriber).unwrap();
 
+    smol::block_on(async_main(args))
+}
+
+async fn async_main(args: Args) -> io::Result<()> {
     // chose git cache directory
     git_cache_dir_set(args.git_cache_dir);
     info!("serving git cache from {}", GIT_CACHE_DIR.get().unwrap());
 
     // start listening
-    let listener = TcpListener::bind(args.listen_address).unwrap();
+    let listener = TcpListener::bind(args.listen_address).await?;
     info!("listening on {}", listener.local_addr().unwrap());
 
     // set up update barrier
@@ -80,7 +83,7 @@ async fn main() {
                 } else {
                     None
                 };
-                monoio::spawn(handle_client(stream, maybe_update_barrier));
+                smol::spawn(handle_client(stream, maybe_update_barrier)).detach();
             }
             Err(e) => {
                 warn!("accepting connection failed: {e}");
@@ -176,7 +179,7 @@ async fn prefetch(url: &str) -> Result<(), Error> {
             trace!("child reaped");
             break;
         }
-        monoio::time::sleep(Duration::from_millis(100)).await;
+        smol::Timer::after(Duration::from_millis(100)).await;
     }
 
     Ok(())
@@ -188,15 +191,14 @@ async fn upload_pack(
     path: Utf8PathBuf,
     version_string: Option<String>,
 ) -> Result<(), Error> {
-    let (stdin_recv, mut stdin_send) = monoio::net::unix::new_pipe()?;
-    let (mut stdout_recv, stdout_send) = monoio::net::unix::new_pipe()?;
-
     let mut path = Utf8PathBuf::from(&format!("{}/{host}{path}", GIT_CACHE_DIR.get().unwrap()));
     path.set_extension("git");
 
     info!("spawning git-upload-pack");
 
-    let mut command = Command::new("git-upload-pack")
+    let peer = stream.peer_addr().unwrap();
+
+    let mut command = smol::process::Command::new("git-upload-pack")
         .env(
             "GIT_PROTOCOL",
             version_string.as_ref().map_or("version=0", |v| v),
@@ -209,37 +211,44 @@ async fn upload_pack(
         .env("GIT_CONFIG_KEY_2", "uploadpack.allowRefInWant")
         .env("GIT_CONFIG_VALUE_2", "true")
         .args(["--strict", path.as_str()])
-        .stdin(stdin_recv)
-        .stdout(stdout_send)
+        .stdin(smol::process::Stdio::piped())
+        .stdout(smol::process::Stdio::piped())
         .spawn()?;
 
-    let peer = stream.peer_addr().unwrap();
-    let (mut read, mut write) = stream.into_split();
+    let mut stdout_recv = command.stdout.take().unwrap();
+    let mut stdin_send = command.stdin.take().unwrap();
+    let (mut read, mut write) = split(stream);
 
     info!("starting git-upload-pack join");
 
-    let (out_n, in_n) = join!(
-        zero_copy(&mut stdout_recv, &mut write),
-        zero_copy(&mut read, &mut stdin_send)
-    );
+    let combo = async { Either::Left(copy(&mut stdout_recv, &mut write).await) }
+        .or(async { Either::Right(copy(&mut read, &mut stdin_send).await) });
+
+    match combo.await {
+        Either::Left(res) => {
+            info!("git-upload-pack exited");
+            let _ = write.close().await;
+        }
+        Either::Right(res) => {
+            info!("peer closed connection");
+            drop(stdin_send);
+        }
+    }
 
     info!("git-upload-pack join done");
 
-    if let Ok(in_bytes) = in_n
-        && let Ok(out_bytes) = out_n
-    {
-        info!("{peer}: in: {in_bytes}b, out: {out_bytes}b");
+    // if let Ok(in_bytes) = in_n
+    //     && let Ok(out_bytes) = out_n
+    // {
+    //     info!("{peer}: in: {in_bytes}b, out: {out_bytes}b");
+    // }
+
+    let res = command.status().await?;
+    if !res.success() {
+        info!("git-upload-pack errored");
     }
 
-    if let Some(res) = command.try_wait()? {
-        if !res.success() {
-            info!("git-upload-pack errored");
-        }
-    } else {
-        info!("child still running");
-        monoio::time::sleep(Duration::from_millis(100)).await;
-    }
-
+    info!("git-upload-pack exited");
     Ok(())
 }
 
@@ -253,13 +262,17 @@ async fn parse_request(stream: &mut TcpStream) -> Result<GitRequest, Error> {
     fn bad_pkt() -> Error {
         Error::new(ErrorKind::InvalidData, "Malformed packet")
     }
-    let mut buf: Vec<u8> = Vec::with_capacity(8 * 1024);
+    let mut buf: Vec<u8> = vec![0u8; 1024];
     let mut res;
+
     loop {
+        info!("loop");
         // read
-        (res, buf) = stream.read(buf).await;
+        res = stream.read(&mut buf).await?;
+        info!("got {res} bytes");
+        info!("buf: {}", buf[0..res].escape_ascii());
         let mut buf_pos = 0usize;
-        buf_pos += res?;
+        buf_pos += res;
         if buf_pos == 0 {
             info!("connection with {} dropped", stream.peer_addr().unwrap());
             return Err(Error::from(ErrorKind::UnexpectedEof));
