@@ -199,7 +199,7 @@ async fn upload_pack(
     let mut command = Command::new("git-upload-pack")
         .env(
             "GIT_PROTOCOL",
-            version_string.as_ref().map_or("version=2", |v| v),
+            version_string.as_ref().map_or("version=0", |v| v),
         )
         .env("GIT_CONFIG_COUNT", "3")
         .env("GIT_CONFIG_KEY_0", "uploadpack.allowAnySHA1InWant")
