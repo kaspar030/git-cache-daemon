@@ -198,7 +198,7 @@ async fn upload_pack(
 
     let mut command = Command::new("git-upload-pack")
         .env(
-            "GIT_PROTOCOL_ENVIRONMENT",
+            "GIT_PROTOCOL",
             version_string.as_ref().map_or("version=2", |v| v),
         )
         .env("GIT_CONFIG_COUNT", "3")
