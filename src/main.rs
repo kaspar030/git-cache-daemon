@@ -294,8 +294,10 @@ async fn parse_request(stream: &mut TcpStream) -> Result<GitRequest, Error> {
         let pkt_len_str = str::from_utf8(&buf[0..4]).map_err(|_| bad_pkt())?;
         let pkt_len = usize::from_str_radix(pkt_len_str, 16).map_err(|_| bad_pkt())?;
 
-        if pkt_len != buf_pos {
-            return Err(bad_pkt());
+        while buf_pos < pkt_len {
+            info!("read more");
+            res = stream.read(&mut buf[buf_pos..]).await?;
+            buf_pos += res;
         }
 
         if pkt_len == 4 {
